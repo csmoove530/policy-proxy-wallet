@@ -1,0 +1,7 @@
+node_modules/
+dist/
+config/keystore.json
+config/policy.json
+data/
+*.db
+.env
