@@ -64,6 +64,7 @@ const PayArgsSchema = z.object({
 const ApproveArgsSchema = z.object({
   approvalId: z.string().min(1, "approvalId is required"),
   approved: z.boolean(),
+  pin: z.string().min(1, "pin is required"),
 });
 
 const HistoryArgsSchema = z.object({
@@ -118,14 +119,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "policy_wallet_approve",
-      description: "Approve or deny a pending payment request (human-in-the-loop). Called by the agent when relaying human's decision.",
+      description: "Approve or deny a pending payment request (human-in-the-loop). The human must provide the one-time PIN printed to their console — ask the human for it before calling this tool.",
       inputSchema: {
         type: "object" as const,
         properties: {
           approvalId: { type: "string" as const, description: "The approval request ID" },
           approved: { type: "boolean" as const, description: "true to approve, false to deny" },
+          pin: { type: "string" as const, description: "One-time PIN shown on the operator console — must be provided by the human" },
         },
-        required: ["approvalId", "approved"],
+        required: ["approvalId", "approved", "pin"],
       },
     },
   ],
@@ -251,7 +253,11 @@ async function handlePay(args: Record<string, unknown>) {
     // concurrent requests see the pending spend during their own policy checks.
     ledger.record(paymentRequest.id, paymentRequest.amountUSD, paymentRequest.timestamp);
 
-    const { promise, message } = requestApproval(paymentRequest, currentConfig.humanApproval.timeoutSeconds);
+    const { promise, message, pin } = requestApproval(paymentRequest, currentConfig.humanApproval.timeoutSeconds);
+
+    // PIN goes to stderr (operator console) only — never into the tool response
+    // so the agent cannot read it and must ask the human to provide it.
+    process.stderr.write(`\n[policy-proxy-wallet] Approval PIN for request ${paymentRequest.id}: ${pin}\n`);
 
     // The MCP tool call blocks here until human responds or timeout
     const approved = await promise;
@@ -434,15 +440,26 @@ function handleApprove(args: Record<string, unknown>) {
         isError: true,
       };
     }
-    const { approvalId, approved } = parsed.data;
+    const { approvalId, approved, pin } = parsed.data;
 
-    const found = handleApprovalResponse(approvalId, approved);
-    if (!found) {
+    const result = handleApprovalResponse(approvalId, pin, approved);
+
+    if (result === "not_found") {
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({ status: "not_found", message: "No pending approval with that ID (may have timed out)" }),
         }],
+      };
+    }
+
+    if (result === "invalid_pin") {
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ status: "error", message: "Invalid PIN. Ask the human to check their console for the correct PIN." }),
+        }],
+        isError: true,
       };
     }
 
