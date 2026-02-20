@@ -3,6 +3,7 @@
  * Backed by the SQLite audit log on startup, then kept in sync.
  */
 export interface LedgerEntry {
+  id: string;
   amountUSD: number;
   timestamp: number; // unix seconds
 }
@@ -10,8 +11,9 @@ export interface LedgerEntry {
 export class SpendingLedger {
   private entries: LedgerEntry[] = [];
 
-  record(amountUSD: number, timestamp?: number): void {
+  record(id: string, amountUSD: number, timestamp?: number): void {
     this.entries.push({
+      id,
       amountUSD,
       timestamp: timestamp ?? Math.floor(Date.now() / 1000),
     });
@@ -34,11 +36,10 @@ export class SpendingLedger {
     this.entries = [...entries, ...this.entries];
   }
 
-  /** Remove a specific record (used when tx fails after pre-recording) */
-  removeLastRecord(_id: string, amountUSD: number, timestamp: number): void {
+  /** Remove a specific record by request ID (used when tx fails or is denied after pre-recording) */
+  removeRecord(id: string): void {
     for (let i = this.entries.length - 1; i >= 0; i--) {
-      const entry = this.entries[i];
-      if (entry && entry.amountUSD === amountUSD && entry.timestamp === timestamp) {
+      if (this.entries[i]?.id === id) {
         this.entries.splice(i, 1);
         return;
       }

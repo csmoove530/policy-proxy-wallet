@@ -71,7 +71,8 @@ export class AuditLog {
   getPaidEntriesForWindow(windowSeconds: number): LedgerEntry[] {
     const cutoff = new Date(Date.now() - windowSeconds * 1000).toISOString();
     const stmt = this.db.prepare(`
-      SELECT amount_usd as amountUSD, 
+      SELECT id,
+        amount_usd as amountUSD,
         CAST(strftime('%s', timestamp) AS INTEGER) as timestamp
       FROM audit_log 
       WHERE final_outcome = 'paid' AND timestamp >= ?
