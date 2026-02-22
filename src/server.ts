@@ -23,7 +23,11 @@ const PROJECT_DIR = join(WORKSPACE, "policy-proxy-wallet");
 const CONFIG_PATH = process.env.POLICY_CONFIG_PATH || join(PROJECT_DIR, "config/policy.json");
 const KEYSTORE_PATH = process.env.KEYSTORE_PATH || join(PROJECT_DIR, "config/keystore.json");
 const DB_PATH = process.env.AUDIT_DB_PATH || join(PROJECT_DIR, "data/audit.db");
-const WALLET_PASSPHRASE = process.env.WALLET_PASSPHRASE || "";
+const WALLET_PASSPHRASE = process.env.WALLET_PASSPHRASE;
+if (!WALLET_PASSPHRASE) {
+  console.error("Fatal: WALLET_PASSPHRASE environment variable is not set. Cannot start server.");
+  process.exit(1);
+}
 
 const SUPPORTED_NETWORKS = ["base"];
 
@@ -60,6 +64,7 @@ const PayArgsSchema = z.object({
 const ApproveArgsSchema = z.object({
   approvalId: z.string().min(1, "approvalId is required"),
   approved: z.boolean(),
+  pin: z.string().min(1, "pin is required"),
 });
 
 const HistoryArgsSchema = z.object({
@@ -114,14 +119,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "policy_wallet_approve",
-      description: "Approve or deny a pending payment request (human-in-the-loop). Called by the agent when relaying human's decision.",
+      description: "Approve or deny a pending payment request (human-in-the-loop). The human must provide the one-time PIN printed to their console — ask the human for it before calling this tool.",
       inputSchema: {
         type: "object" as const,
         properties: {
           approvalId: { type: "string" as const, description: "The approval request ID" },
           approved: { type: "boolean" as const, description: "true to approve, false to deny" },
+          pin: { type: "string" as const, description: "One-time PIN shown on the operator console — must be provided by the human" },
         },
-        required: ["approvalId", "approved"],
+        required: ["approvalId", "approved", "pin"],
       },
     },
   ],
@@ -243,12 +249,23 @@ async function handlePay(args: Record<string, unknown>) {
 
   // Issue #2: await human approval flow
   if (decision.action === "require_human_approval") {
-    const { promise, message } = requestApproval(paymentRequest, currentConfig.humanApproval.timeoutSeconds);
+    // Reserve this amount in the ledger BEFORE awaiting human input so that
+    // concurrent requests see the pending spend during their own policy checks.
+    ledger.record(paymentRequest.id, paymentRequest.amountUSD, paymentRequest.timestamp);
+
+    const { promise, message, pin } = requestApproval(paymentRequest, currentConfig.humanApproval.timeoutSeconds);
+
+    // PIN goes to stderr (operator console) only — never into the tool response
+    // so the agent cannot read it and must ask the human to provide it.
+    process.stderr.write(`\n[policy-proxy-wallet] Approval PIN for request ${paymentRequest.id}: ${pin}\n`);
 
     // The MCP tool call blocks here until human responds or timeout
     const approved = await promise;
 
     if (!approved) {
+      // Release the reserved ledger entry — payment will not proceed
+      ledger.removeRecord(paymentRequest.id);
+
       const audit: AuditEntry = {
         id,
         timestamp: new Date().toISOString(),
@@ -274,16 +291,25 @@ async function handlePay(args: Record<string, unknown>) {
       };
     }
 
-    return await executePayment(paymentRequest, "human", currentConfig);
+    return await executePayment(paymentRequest, "human", currentConfig, true);
   }
 
-  // Auto-approved: execute payment
-  return await executePayment(paymentRequest, "auto", currentConfig);
+  // Auto-approved: execute payment (executePayment will record the ledger entry)
+  return await executePayment(paymentRequest, "auto", currentConfig, false);
 }
 
-async function executePayment(request: PaymentRequest, approvalType: "auto" | "human", currentConfig: ReturnType<typeof loadConfig>) {
-  // Issue #7: record in ledger BEFORE sending tx
-  ledger.record(request.amountUSD, request.timestamp);
+async function executePayment(
+  request: PaymentRequest,
+  approvalType: "auto" | "human",
+  currentConfig: ReturnType<typeof loadConfig>,
+  preRecorded = false,
+) {
+  // Record in ledger BEFORE sending tx to prevent concurrent requests from
+  // exceeding limits. Human-approval path pre-records before the await, so
+  // skip re-recording to avoid double-counting.
+  if (!preRecorded) {
+    ledger.record(request.id, request.amountUSD, request.timestamp);
+  }
 
   try {
     const result = await sendUSDC(walletConfig, request.payTo, request.amount);
@@ -322,8 +348,8 @@ async function executePayment(request: PaymentRequest, approvalType: "auto" | "h
       }],
     };
   } catch (err: unknown) {
-    // Issue #7: remove ledger record if tx fails
-    ledger.removeLastRecord(request.id, request.amountUSD, request.timestamp);
+    // Roll back the ledger entry — tx did not complete
+    ledger.removeRecord(request.id);
 
     const message = err instanceof Error ? err.message : String(err);
     const audit: AuditEntry = {
@@ -414,15 +440,26 @@ function handleApprove(args: Record<string, unknown>) {
         isError: true,
       };
     }
-    const { approvalId, approved } = parsed.data;
+    const { approvalId, approved, pin } = parsed.data;
 
-    const found = handleApprovalResponse(approvalId, approved);
-    if (!found) {
+    const result = handleApprovalResponse(approvalId, pin, approved);
+
+    if (result === "not_found") {
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({ status: "not_found", message: "No pending approval with that ID (may have timed out)" }),
         }],
+      };
+    }
+
+    if (result === "invalid_pin") {
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ status: "error", message: "Invalid PIN. Ask the human to check their console for the correct PIN." }),
+        }],
+        isError: true,
       };
     }
 

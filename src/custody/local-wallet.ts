@@ -25,9 +25,41 @@ export interface SendResult {
 }
 
 /**
+ * Validate passphrase strength for wallet encryption.
+ * Throws with a descriptive message if any requirement is not met.
+ */
+export function validatePassphrase(passphrase: string): void {
+  const errors: string[] = [];
+
+  if (passphrase.length < 12) {
+    errors.push("at least 12 characters");
+  }
+  if (!/[A-Z]/.test(passphrase)) {
+    errors.push("at least one uppercase letter (A–Z)");
+  }
+  if (!/[a-z]/.test(passphrase)) {
+    errors.push("at least one lowercase letter (a–z)");
+  }
+  if (!/[0-9]/.test(passphrase)) {
+    errors.push("at least one digit (0–9)");
+  }
+  if (!/[^A-Za-z0-9]/.test(passphrase)) {
+    errors.push("at least one special character (e.g. !@#$%^&*)");
+  }
+
+  if (errors.length > 0) {
+    throw new Error(
+      `Passphrase does not meet security requirements. It must contain:\n` +
+        errors.map((e) => `  • ${e}`).join("\n")
+    );
+  }
+}
+
+/**
  * Generate a new wallet and save as encrypted keystore.
  */
 export async function initWallet(keystorePath: string, passphrase: string): Promise<string> {
+  validatePassphrase(passphrase);
   if (existsSync(keystorePath)) {
     throw new Error(`Keystore already exists at ${keystorePath}. Use --force to overwrite.`);
   }

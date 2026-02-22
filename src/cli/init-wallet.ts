@@ -1,4 +1,4 @@
-import { initWallet } from "../custody/local-wallet.js";
+import { initWallet, validatePassphrase } from "../custody/local-wallet.js";
 import { join } from "node:path";
 
 const WORKSPACE = process.env.WORKSPACE || join(process.env.HOME || "/home/node", ".openclaw/workspace");
@@ -12,6 +12,14 @@ if (!rawPassphrase) {
   console.error("  Store it securely. You will need it to start the proxy server.");
   process.exit(1);
 }
+
+try {
+  validatePassphrase(rawPassphrase);
+} catch (err: unknown) {
+  console.error(err instanceof Error ? err.message : err);
+  process.exit(1);
+}
+
 const passphrase: string = rawPassphrase;
 
 const force = process.argv.includes("--force");
